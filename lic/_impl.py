@@ -29,9 +29,215 @@ import base64
 import hashlib
 import hmac
 import json
+from collections.abc import Mapping
 
 MAX_SKEW_SECONDS = 300
 MAX_VALIDITY_SECONDS = 366 * 24 * 60 * 60
+
+_BASE64_ALPHABET = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+)
+_HEX_DIGITS = frozenset("0123456789abcdef")
+
+_REQUIRED_FINGERPRINT_FIELDS = frozenset(
+    {"hostname", "system_uuid", "network_adapters", "volume_ids"}
+)
+_REQUIRED_PAYLOAD_FIELDS = frozenset(
+    {"license_id", "machine", "not_before", "not_after", "features"}
+)
+_REQUIRED_MACHINE_FIELDS = frozenset({"fingerprints", "max_permutations"})
+_REQUIRED_RECORD_FIELDS = frozenset(
+    {"license_id", "text", "signature", "fingerprint"}
+)
+
+
+def _is_int(value) -> bool:
+    """True only for real integers; bool is not an integer time value."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_hex64(value) -> bool:
+    """True only for a complete 64-character lowercase hexadecimal value."""
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in _HEX_DIGITS for character in value)
+    )
+
+
+def _normalize_identifiers(values, field) -> list:
+    """Return sorted, de-duplicated non-empty strings for a device field."""
+    if isinstance(values, (str, bytes, bytearray)):
+        raise ValueError(f"{field} must be an iterable of non-empty strings")
+    try:
+        items = list(values)
+    except TypeError as exc:
+        raise ValueError(
+            f"{field} must be an iterable of non-empty strings"
+        ) from exc
+    if not items:
+        raise ValueError(f"{field} must not be empty")
+    for item in items:
+        if not isinstance(item, str) or not item:
+            raise ValueError(f"{field} must contain non-empty strings")
+    return sorted(set(items))
+
+
+def _reject_duplicate_keys(pairs) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate object key: {key}")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(name):
+    raise ValueError(f"invalid JSON constant: {name}")
+
+
+def _text_to_body(text) -> bytes:
+    """Strictly decode unpadded URL-safe base64 text to its raw bytes."""
+    if not isinstance(text, str):
+        raise ValueError("text must be a string")
+    if any(character not in _BASE64_ALPHABET for character in text):
+        raise ValueError("text is not unpadded URL-safe base64")
+    if len(text) % 4 == 1:
+        raise ValueError("text has an impossible base64 length")
+    padded = text + "=" * ((-len(text)) % 4)
+    try:
+        body = base64.b64decode(
+            padded.encode("ascii"), altchars=b"-_", validate=True
+        )
+    except ValueError as exc:
+        raise ValueError("text is not valid base64") from exc
+    if base64.urlsafe_b64encode(body).rstrip(b"=").decode("ascii") != text:
+        raise ValueError("text is not canonical URL-safe base64")
+    return body
+
+
+def _body_to_payload(body) -> dict:
+    """Parse raw body bytes into a structurally valid payload dictionary."""
+    try:
+        body_text = body.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("body is not valid UTF-8") from exc
+    try:
+        payload = json.loads(
+            body_text,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_json_constant,
+        )
+    except ValueError as exc:
+        raise ValueError("body is not a valid JSON document") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("body must be a JSON object")
+    if set(payload.keys()) != _REQUIRED_PAYLOAD_FIELDS:
+        raise ValueError("payload has missing or unknown fields")
+
+    license_id = payload["license_id"]
+    if not isinstance(license_id, str) or not license_id:
+        raise ValueError("license_id must be a non-empty string")
+
+    machine = payload["machine"]
+    if not isinstance(machine, dict):
+        raise ValueError("machine must be an object")
+    if not _REQUIRED_MACHINE_FIELDS <= set(machine.keys()):
+        raise ValueError("machine is missing required fields")
+    fingerprints = machine["fingerprints"]
+    if not isinstance(fingerprints, list):
+        raise ValueError("machine fingerprints must be a list")
+    for fingerprint in fingerprints:
+        if not isinstance(fingerprint, str) or not fingerprint:
+            raise ValueError("machine fingerprints must be non-empty strings")
+    if not _is_int(machine["max_permutations"]):
+        raise ValueError("max_permutations must be an integer")
+
+    if not _is_int(payload["not_before"]):
+        raise ValueError("not_before must be an integer")
+    if not _is_int(payload["not_after"]):
+        raise ValueError("not_after must be an integer")
+
+    features = payload["features"]
+    if not isinstance(features, list):
+        raise ValueError("features must be a list")
+    for feature in features:
+        if not isinstance(feature, str) or not feature:
+            raise ValueError("features must contain non-empty strings")
+
+    return payload
+
+
+def _valid_feature_registry(known_features) -> bool:
+    if not isinstance(known_features, list):
+        return False
+    for feature in known_features:
+        if not isinstance(feature, str) or not feature:
+            return False
+    return len(set(known_features)) == len(known_features)
+
+
+def _invalid(reason) -> dict:
+    return {"valid": False, "reason": reason, "features": []}
+
+
+def _validate_record(record, key, known_features, skew, max_validity, now) -> dict:
+    """Validate one batch record without consulting any other record."""
+    # 1. Record shape.  A malformed record is reported, not raised: the
+    #    batch contract requires one bad record not to abort the batch.
+    if not _REQUIRED_RECORD_FIELDS <= set(record.keys()):
+        return _invalid("bad_record")
+    text = record["text"]
+    signature = record["signature"]
+    fingerprint = record["fingerprint"]
+    if not isinstance(text, str) or not isinstance(signature, str):
+        return _invalid("bad_record")
+    if not _is_hex64(fingerprint):
+        return _invalid("bad_record")
+
+    # 2. Strict base64 decoding of the text, before any parsing.
+    try:
+        body = _text_to_body(text)
+    except ValueError:
+        return _invalid("bad_text")
+
+    # 3. Signature over the raw decoded body, before the body is parsed.
+    if not verify_signature(body, signature, key):
+        return _invalid("bad_signature")
+
+    # 4. Only now may the payload be parsed and trusted.
+    try:
+        payload = _body_to_payload(body)
+    except ValueError:
+        return _invalid("bad_license")
+
+    # 5. Binding against this record's own observed fingerprint only.
+    try:
+        bound = check_binding(payload, fingerprint)
+    except ValueError:
+        return _invalid("bad_license")
+    if not bound:
+        return _invalid("machine_mismatch")
+
+    # 6. Policy validity limit applies to the signed window size.
+    if payload["not_after"] - payload["not_before"] > max_validity:
+        return _invalid("policy_validity")
+
+    # 7. Expiry, with the policy skew applied exactly once at each endpoint.
+    try:
+        if not check_expiry(payload, now, skew):
+            return _invalid("expired")
+    except ValueError:
+        return _invalid("bad_license")
+
+    # 8. Features come from the registry, never from the body alone.
+    try:
+        granted = grant_features(payload, known_features)
+    except ValueError as exc:
+        if str(exc).startswith("unknown feature:"):
+            return _invalid("unknown_feature")
+        return _invalid("bad_license")
+    return {"valid": True, "reason": None, "features": granted}
 
 
 def machine_fingerprint(sources) -> str:
@@ -51,7 +257,34 @@ def machine_fingerprint(sources) -> str:
 
     The fingerprint is evidence for binding, not a secret.
     """
-    raise NotImplementedError("machine_fingerprint")
+    if not isinstance(sources, Mapping):
+        raise ValueError("sources must be a mapping")
+    if set(sources.keys()) != _REQUIRED_FINGERPRINT_FIELDS:
+        raise ValueError("sources has missing or unknown fields")
+
+    hostname = sources["hostname"]
+    system_uuid = sources["system_uuid"]
+    if not isinstance(hostname, str) or not hostname:
+        raise ValueError("hostname must be a non-empty string")
+    if not isinstance(system_uuid, str) or not system_uuid:
+        raise ValueError("system_uuid must be a non-empty string")
+
+    body = json.dumps(
+        {
+            "hostname": hostname,
+            "network_adapters": _normalize_identifiers(
+                sources["network_adapters"], "network_adapters"
+            ),
+            "system_uuid": system_uuid,
+            "volume_ids": _normalize_identifiers(
+                sources["volume_ids"], "volume_ids"
+            ),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(body).hexdigest()
 
 
 def decode_license(text) -> dict:
@@ -73,7 +306,7 @@ def decode_license(text) -> dict:
     verify the signature over the original decoded body bytes before using
     any value returned here; never decode or trust a body first.
     """
-    raise NotImplementedError("decode_license")
+    return _body_to_payload(_text_to_body(text))
 
 
 def verify_signature(body, signature, key) -> bool:
@@ -89,7 +322,14 @@ def verify_signature(body, signature, key) -> bool:
     equality operator for the secret comparison.  Return True only on an
     exact match.  Signature tolerance is zero.
     """
-    raise NotImplementedError("verify_signature")
+    if not isinstance(body, (bytes, bytearray, memoryview)):
+        raise TypeError("body must be bytes-like")
+    if not isinstance(key, (bytes, bytearray)) or not len(key):
+        raise ValueError("key must be non-empty bytes")
+    if not _is_hex64(signature):
+        return False
+    expected = hmac.new(bytes(key), bytes(body), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature)
 
 
 def check_expiry(payload, now, skew) -> bool:
@@ -108,7 +348,21 @@ def check_expiry(payload, now, skew) -> bool:
     are accepted exactly and no extra tolerance exists.  Invalid fields or
     now outside the integer range raise ValueError.
     """
-    raise NotImplementedError("check_expiry")
+    if not isinstance(payload, Mapping):
+        raise ValueError("payload must be a mapping")
+    if "not_before" not in payload or "not_after" not in payload:
+        raise ValueError("payload is missing validity fields")
+    not_before = payload["not_before"]
+    not_after = payload["not_after"]
+    if not _is_int(not_before) or not _is_int(not_after):
+        raise ValueError("validity bounds must be integers")
+    if not _is_int(now):
+        raise ValueError("now must be an integer")
+    if not _is_int(skew) or skew < 0 or skew > MAX_SKEW_SECONDS:
+        raise ValueError("skew must be an integer from 0 through MAX_SKEW_SECONDS")
+    if not_before > not_after:
+        raise ValueError("not_before must not exceed not_after")
+    return not_before - skew <= now <= not_after + skew
 
 
 def check_binding(payload, fingerprint) -> bool:
@@ -127,7 +381,37 @@ def check_binding(payload, fingerprint) -> bool:
     forbidden.  Invalid shapes raise ValueError; a well-formed but
     unauthorized fingerprint returns False.
     """
-    raise NotImplementedError("check_binding")
+    if not isinstance(payload, Mapping):
+        raise ValueError("payload must be a mapping")
+    if "machine" not in payload:
+        raise ValueError("payload is missing machine")
+    machine = payload["machine"]
+    if not isinstance(machine, Mapping):
+        raise ValueError("machine must be an object")
+    if not _REQUIRED_MACHINE_FIELDS <= set(machine.keys()):
+        raise ValueError("machine is missing required fields")
+
+    authorized = machine["fingerprints"]
+    if not isinstance(authorized, list) or not authorized:
+        raise ValueError("fingerprints must be a non-empty list")
+    for value in authorized:
+        if not _is_hex64(value):
+            raise ValueError("authorized fingerprints must be 64 hex characters")
+
+    max_permutations = machine["max_permutations"]
+    if not _is_int(max_permutations) or max_permutations < 0:
+        raise ValueError("max_permutations must be a non-negative integer")
+    if len(authorized) > max_permutations + 1:
+        raise ValueError("too many authorized fingerprints")
+
+    if not _is_hex64(fingerprint):
+        raise ValueError("fingerprint must be 64 lowercase hex characters")
+
+    matched = False
+    for value in authorized:
+        # Full-length constant-time comparison; never a prefix comparison.
+        matched |= hmac.compare_digest(fingerprint, value)
+    return bool(matched)
 
 
 def grant_features(payload, features) -> list:
@@ -143,7 +427,39 @@ def grant_features(payload, features) -> list:
     order, so callers cannot mutate the payload through the result.
     Invalid registry data or duplicate payload features raise ValueError.
     """
-    raise NotImplementedError("grant_features")
+    if not isinstance(payload, Mapping):
+        raise ValueError("payload must be a mapping")
+    if "features" not in payload:
+        raise ValueError("payload is missing features")
+    requested = payload["features"]
+    if not isinstance(requested, list):
+        raise ValueError("payload features must be a list")
+    for feature in requested:
+        if not isinstance(feature, str) or not feature:
+            raise ValueError("payload features must be non-empty strings")
+    if len(set(requested)) != len(requested):
+        raise ValueError("payload features must be unique")
+
+    if isinstance(features, (str, bytes, bytearray)):
+        raise ValueError("feature registry must be an iterable of names")
+    try:
+        registry = list(features)
+    except TypeError as exc:
+        raise ValueError(
+            "feature registry must be an iterable of names"
+        ) from exc
+    for feature in registry:
+        if not isinstance(feature, str) or not feature:
+            raise ValueError("feature registry must contain non-empty strings")
+    if len(set(registry)) != len(registry):
+        raise ValueError("feature registry must be unique")
+
+    known = set(registry)
+    for feature in requested:
+        if feature not in known:
+            raise ValueError(f"unknown feature: {feature}")
+
+    return sorted(requested)
 
 
 def validate_policy(policy) -> list[str]:
@@ -169,7 +485,29 @@ def validate_policy(policy) -> list[str]:
     enforced by grant_features.  It does not require an expiry field; it
     validates the policy limits that will be applied to licenses.
     """
-    raise NotImplementedError("validate_policy")
+    if not isinstance(policy, Mapping):
+        raise ValueError("policy must be a mapping")
+
+    issues = []
+
+    key = policy.get("key")
+    if not isinstance(key, (bytes, bytearray)) or not len(key):
+        issues.append("key_invalid")
+
+    if not _valid_feature_registry(policy.get("known_features")):
+        issues.append("known_features_invalid")
+
+    skew = policy.get("skew")
+    if not _is_int(skew) or skew < 0 or skew > MAX_SKEW_SECONDS:
+        issues.append("skew_invalid")
+
+    max_validity = policy.get("max_validity_seconds")
+    if not _is_int(max_validity) or max_validity <= 0:
+        issues.append("max_validity_invalid")
+    elif max_validity > MAX_VALIDITY_SECONDS:
+        issues.append("validity_too_long")
+
+    return issues
 
 
 def license_batch(licenses, policy, now) -> dict:
@@ -201,4 +539,44 @@ def license_batch(licenses, policy, now) -> dict:
     alone.  Overall malformed arguments, duplicate license_id values, or
     an unusable policy raise ValueError instead of producing results.
     """
-    raise NotImplementedError("license_batch")
+    if isinstance(licenses, (str, bytes, bytearray)):
+        raise ValueError("licenses must be a sequence of records")
+    try:
+        records = list(licenses)
+    except TypeError as exc:
+        raise ValueError("licenses must be a sequence of records") from exc
+
+    if not isinstance(policy, Mapping):
+        raise ValueError("policy must be a mapping")
+    policy_issues = validate_policy(policy)
+    if policy_issues:
+        raise ValueError(
+            "unusable policy: " + ", ".join(policy_issues)
+        )
+
+    if not _is_int(now):
+        raise ValueError("now must be an integer")
+
+    license_ids = []
+    for record in records:
+        if not isinstance(record, Mapping):
+            raise ValueError("each record must be a mapping")
+        license_id = record.get("license_id")
+        if not isinstance(license_id, str) or not license_id:
+            raise ValueError("each record needs a non-empty license_id")
+        license_ids.append(license_id)
+    if len(set(license_ids)) != len(license_ids):
+        raise ValueError("duplicate license_id values")
+
+    key = bytes(policy["key"])
+    known_features = policy["known_features"]
+    skew = policy["skew"]
+    max_validity = policy["max_validity_seconds"]
+
+    results = {}
+    for record, license_id in zip(records, license_ids):
+        # Each call uses only this record's own fingerprint and fields.
+        results[license_id] = _validate_record(
+            record, key, known_features, skew, max_validity, now
+        )
+    return results
